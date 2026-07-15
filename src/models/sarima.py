@@ -2,10 +2,29 @@ import pandas as pd
 import numpy as np
 
 from pmdarima.arima import auto_arima
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
 
-def sarimax_forecast(ts_data, n_forecast, target_col=None, exog_cols=None):
+def eval_metrics(actual, forecast):
+
+        mse = mean_squared_error(actual, forecast)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(actual, forecast)
+        mape = np.mean(np.abs((actual - forecast) / actual)) * 100
+        std = np.std(actual)
+
+        results = {"RMSE": rmse, "MAE": mae, "MSE": mse, "MAPE": mape, "STD": std}
+
+        return results
+
+def sarimax_forecast(ts_data, n_forecast, target_col=None):
+
+    if isinstance(ts_data, pd.Series):
+        exog_cols = None
+    
+    else:
+        exog_cols = ts_data.columns.drop(target_col).tolist()
+        
     n_forecast = int(n_forecast)
 
     if exog_cols is None:
@@ -25,36 +44,35 @@ def sarimax_forecast(ts_data, n_forecast, target_col=None, exog_cols=None):
     return arima_model, arima_pred, conf_int
 
 
-def sarimax_test(ts_data, n_splits, test_size, target_col=None, exog_cols=None):
+def sarimax_test(ts_data, n_splits, test_size, target_col=None):
+    
+    if isinstance(ts_data, pd.Series):
+        exog_cols = None
+    
+    else:
+        exog_cols = ts_data.columns.drop(target_col).tolist()
+
     tscv = TimeSeriesSplit(n_splits=n_splits, test_size=test_size)
-    rmse = {}
-    naive_rmse = {}
+    results = []
 
     print(f"Folds: {n_splits}")
     print(f"Test Size: {test_size}")
 
-    for n_split, (train_idx, test_idx) in enumerate(tscv.split(ts_data), start=1):
+    for _, (train_idx, test_idx) in enumerate(tscv.split(ts_data), start=1):
         ts_data_train = ts_data.iloc[train_idx]
         ts_data_test = ts_data.iloc[test_idx]
 
-        _, arima_pred, _ = sarimax_forecast(ts_data_train, len(ts_data_test), target_col=target_col, exog_cols=exog_cols)
+        _, arima_pred, _ = sarimax_forecast(ts_data_train, len(ts_data_test), target_col=target_col)
 
         actual = ts_data_test if exog_cols is None else ts_data_test[target_col]
-        actual_std = np.std(actual)
 
-        rmse_split = np.sqrt(mean_squared_error(actual, arima_pred))
-        rmse[n_split] = rmse_split
+        eval = eval_metrics(actual, arima_pred)
+        results.append(eval)
 
-        history = ts_data_train if exog_cols is None else ts_data_train[target_col]
-        naive_pred = np.tile(history.iloc[-12:].to_numpy(), int(np.ceil(len(actual) / 12)))[:len(actual)]
-
-        naive_rmse_split = np.sqrt(mean_squared_error(actual, naive_pred))
-        naive_rmse[n_split] = naive_rmse_split
-
-        print(f"Fold {n_split}, Test RMSE: {rmse_split:.2f}, Seasonal Naive RMSE: {naive_rmse_split:.2f}, STD: {actual_std:.2f}")
-
-    rmse_values = np.fromiter(rmse.values(), dtype=float)
-    naive_rmse_values = np.fromiter(naive_rmse.values(), dtype=float)
-
-    print(f"RMSE Mean: {rmse_values.mean():.2f}   Seasonal Naive Mean: {naive_rmse_values.mean():.2f}")
-    print(f"RMSE STD: {rmse_values.std():.2f}   Seasonal Naive STD: {naive_rmse_values.std():.2f}")
+    fold = pd.Series([*range(1, n_splits+1)], name = 'Fold')
+    results = pd.DataFrame(results)
+    
+    df = pd.concat([fold, results], axis = 1)
+    df = df.set_index('Fold')
+    
+    return df

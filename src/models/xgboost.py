@@ -4,11 +4,23 @@ import numpy as np
 import shap
 
 from xgboost import XGBRegressor
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 
 from scipy.stats import randint, uniform, loguniform
 
+
+def eval_metrics(actual, forecast):
+
+        mse = mean_squared_error(actual, forecast)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(actual, forecast)
+        mape = np.mean(np.abs((actual - forecast) / actual)) * 100
+        std = np.std(actual)
+
+        results = {"RMSE": rmse, "MAE": mae, "MSE": mse, "MAPE": mape, "STD": std}
+
+        return results
 
 def create_date_features(data):
     
@@ -114,6 +126,10 @@ def model_pred(train_feat, train_targ, pred_feat, n_iter):
     return pred_targ, model_test
 
 def test_diag(data, targ_col, n_iter):
+
+    if isinstance(data, pd.Series):
+        data = data.to_frame(name=targ_col if data.name is None else data.name)
+
     feat_cols = [col for col in data.columns if col != targ_col]
     train_feat, train_targ, test_feat, test_targ = train_test_split(data.dropna(), 24, targ_col=targ_col, feat_cols=feat_cols)
     pred_targ, model_test = model_pred(train_feat=train_feat, train_targ=train_targ, pred_feat=test_feat, n_iter=n_iter)
