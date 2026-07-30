@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 from pmdarima.arima import auto_arima
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 
 def eval_metrics(actual, forecast):
@@ -10,10 +10,10 @@ def eval_metrics(actual, forecast):
         mse = mean_squared_error(actual, forecast)
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(actual, forecast)
-        mape = np.mean(np.abs((actual - forecast) / actual)) * 100
+        r2 = r2_score(actual, forecast)
         std = np.std(actual)
 
-        results = {"RMSE": rmse, "MAE": mae, "MSE": mse, "MAPE": mape, "STD": std}
+        results = {"RMSE": rmse, "MAE": mae, "R2": r2, "STD": std, "RMSE/STD": rmse / std}
 
         return results
 

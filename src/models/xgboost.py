@@ -1,24 +1,30 @@
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
 import shap
 
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from statsmodels.tsa.stattools import pacf
 
 from scipy.stats import randint, uniform, loguniform
 
+
+def sig_lags(data, n_sig_lags):
+    pacf_vals = pacf(data)
+    lag_vals = sorted(enumerate(pacf_vals[1:], start=1), key=lambda x: abs(x[1]), reverse=True)[:n_sig_lags]
+
+    return sorted(lag for lag, _ in lag_vals)
 
 def eval_metrics(actual, forecast):
 
         mse = mean_squared_error(actual, forecast)
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(actual, forecast)
-        mape = np.mean(np.abs((actual - forecast) / actual)) * 100
+        r2 = r2_score(actual, forecast)
         std = np.std(actual)
 
-        results = {"RMSE": rmse, "MAE": mae, "MSE": mse, "MAPE": mape, "STD": std}
+        results = {"RMSE": rmse, "MAE": mae, "R2": r2, "STD": std, "RMSE/STD": rmse / std}
 
         return results
 
@@ -32,9 +38,15 @@ def create_date_features(data):
 
 def create_lag_features(data, lag_list, lag_column = None):
 
-    if lag_column is None:
+    """
+    Inputs series/dataframe \\
+    Returns original series/dataframe with lag features appended
+    """
+
+    if isinstance(data, pd.Series):
         column = data
         lag_column = data.name
+
     else:
         column = data[lag_column]
 
@@ -46,44 +58,89 @@ def create_lag_features(data, lag_list, lag_column = None):
 
 def create_rolling_features(data, window_list, rolling_column = None):
 
-    if rolling_column is None:
+    """
+    Inputs series/dataframe \\
+    Returns dataframe with rolling features appended to the input
+    """
+
+    if isinstance(data, pd.Series):
         column = data
         rolling_column = data.name
+
     else:
         column = data[rolling_column]
 
-    
     rolling_columns = [data,]
+
     for window in window_list:
         rolling_columns.append(pd.Series(column.shift(1).rolling(window).mean(), name = '{}_RollMean{}'.format(rolling_column, window))) #lagged to avoid leakage
         rolling_columns.append(pd.Series(column.shift(1).rolling(window).std(), name = '{}_RollSTD{}'.format(rolling_column, window)))
     
     return pd.concat(rolling_columns, axis = 1)
 
-def train_forecast_split(data, target_col, lag_list=[1, 2, 13, 24], window_list=[3, 6, 12]):
+def make_lagroll_features(data, target_col, window_list, lag_list):
+
+    """
+    Inputs series/dataframe and the column to be lagged and rolled \\
+    Returns dataframe with consolidated lag and window features.
+    """
 
     if isinstance(data, pd.Series):
         data = data.to_frame(name=target_col if data.name is None else data.name)
 
-    exog_cols = data.columns.drop(target_col).to_list()
+    
+    for col in data.columns.to_list():
+        data = create_lag_features(data=data, lag_list = lag_list, lag_column = col)
+        data = create_rolling_features(data=data, window_list = window_list, rolling_column = col)
 
-    date = create_date_features(data=data.dropna())
-    lag = create_lag_features(data=date, lag_list=lag_list, lag_column=target_col)
-    final = create_rolling_features(data=lag, rolling_column=target_col, window_list=window_list)
+    data = create_date_features(data)
 
-    if exog_cols:
-        for col in exog_cols:
-            final = create_lag_features(data=final, lag_list=lag_list, lag_column=col)
-            final = create_rolling_features(data=final, rolling_column=col, window_list=window_list)
-
-    forecast_feat = final[final.columns.drop(target_col).to_list()].iloc[[-1]]
-
-    return final, forecast_feat
+    return data
 
 
-def best_params(n_iter):
+def prep_training_data(data, target_col):
+
+    """
+    Accepts preprocessed data with full features \\
+    Returns the full dataframe (lagged) for forecasting and the forecast features
+    """
+    data = data.copy()
+    data[target_col] = data[target_col].shift(-1)
+    data.index = data.index + pd.offsets.MonthBegin(1)
+
+    feats = data.drop(columns=[target_col])
+    
+    return data.dropna(), feats.iloc[[-1]]
+
+
+def train_test_split(data, target_col, test_size):
+
+    """
+    Accepts preprocessed data
+    Returns split 
+    """
+
+    feat_cols = data.columns.drop(target_col).to_list()
+
+    data_train = data[:-test_size]
+    data_test = data[-test_size:]
+
+    x_train = data_train[feat_cols]
+    x_test = data_test[feat_cols]
+    y_train = data_train[target_col]
+    y_test = data_test[target_col]
+
+    return x_train, y_train, x_test, y_test
+
+def opt_model(n_iter, test_size):
+
+    """
+    Inputs number of grid samples and test size \\
+    Returns the model with the optimal set of parameters evaluated through time-series cross validation.
+    """
+    
     param_grid = {
-    "n_estimators": randint(200, 2500),
+    "n_estimators": randint(50, 1000),
     "learning_rate": loguniform(0.005, 0.2),
     "max_depth": randint(2, 10),
     "min_child_weight": randint(1, 15),
@@ -94,128 +151,154 @@ def best_params(n_iter):
     "reg_lambda": loguniform(1e-2, 100)
     }
 
-    tscv = TimeSeriesSplit(n_splits=5, test_size = 24)
+    tscv = TimeSeriesSplit(n_splits=5, test_size = test_size)
     base_model = XGBRegressor(objective="reg:squarederror", random_state=420)
     search = RandomizedSearchCV(base_model, param_distributions=param_grid, n_iter = n_iter, scoring="neg_root_mean_squared_error", cv=tscv, random_state=420, n_jobs=-1)
     
     return search
 
-def train_test_split(data, n_months, targ_col, feat_cols):
-    
-    if type(targ_col) == str:
-        targ_col = targ_col
-
-    else:
-        targ_col = targ_col[0]
-    
-    train = data[:-n_months]
-    test = data[-n_months:]
-
-    train_targ = train[targ_col]
-    train_feat = train[feat_cols]
-    test_targ = test[targ_col]
-    test_feat = test[feat_cols]
-
-
-    return train_feat, train_targ, test_feat, test_targ
-
-def model_pred(train_feat, train_targ, pred_feat, n_iter):
-    model_test = best_params(n_iter)
-    model_test.fit(train_feat, train_targ)
-    pred_targ = model_test.best_estimator_.predict(pred_feat)
-    return pred_targ, model_test
-
-def test_diag(data, targ_col, n_iter):
-
-    if isinstance(data, pd.Series):
-        data = data.to_frame(name=targ_col if data.name is None else data.name)
-
-    feat_cols = [col for col in data.columns if col != targ_col]
-    train_feat, train_targ, test_feat, test_targ = train_test_split(data.dropna(), 24, targ_col=targ_col, feat_cols=feat_cols)
-    pred_targ, model_test = model_pred(train_feat=train_feat, train_targ=train_targ, pred_feat=test_feat, n_iter=n_iter)
-    rmse = np.sqrt(mean_squared_error(test_targ, pred_targ))
-    std = np.std(test_targ)
-    r2 = r2_score(test_targ, pred_targ)
-    cv_rmse = -model_test.best_score_
-    rows = len(data)
-    print(f"Rows      : {rows}")
-    print(f"CV RMSE   : {cv_rmse:.3f}")
-    print(f"Test RMSE : {rmse:.3f}")
-    print(f"Test STD  : {std:.3f}")
-    print(f"R²        : {r2:.3f}")
-    print(f"Best Params:\n{model_test.best_params_}")
-    return {"cv_rmse": cv_rmse, "test_rmse": rmse, "test_std": std, "r2": r2, "best_params": model_test.best_params_}
-
-def forecast_df(data, targ_col):
-
-    feat_cols = [col for col in data.columns if col != targ_col]
-
-    forecast_feat = data[feat_cols].iloc[[-1]].copy()
-
-    forecast_feat.index = forecast_feat.index + pd.offsets.MonthBegin(1)
-
-    full_feat = data[feat_cols].copy()
-    full_feat.index = full_feat.index + pd.offsets.MonthBegin(1)
-
-    full_targ = data[targ_col]
-
-    full_df = pd.concat([full_targ, full_feat], axis=1).dropna()
-
-    return full_df[feat_cols], full_df[targ_col], forecast_feat
-
-
-def months_ahead_forecast(data, target_col, months_ahead):
+def one_step_forecast(data, target_col, test_size, n_iter):
 
     """
-    Generates recursive multi-step forecasts for the target variable by first training an XGBoost model on the target and separate models for each exogenous variable, if provided, forecasting exogenous variables at each step, updating the dataset with predicted values, regenerating lag and rolling features, predicting the target for the next period, and repeating the process until the specified forecast horizon is reached. Displays a SHAP waterfall plot explaining the first forecast and returns a DataFrame containing the forecasted observations for the specified number of months ahead.
-
-    args:
-        data (pd.Series or pd.DataFrame): Time-indexed target series or DataFrame containing the target and optional exogenous variables.
-        target_col (str): Name of the target variable to forecast.
-        months_ahead (int): Number of future periods to forecast recursively.
-
-    returns:
-        pd.DataFrame: DataFrame containing the forecasted target and exogenous variable values for the specified forecast horizon.
+    Input preprocessed data
+    Returns forecast features, optimal model, and one-step-ahead forecast
+    
     """
 
-    iter = 1
+    training, forecast_feat = prep_training_data(data = data, target_col = target_col)
 
+    feat_cols = data.columns.drop(target_col).to_list()
+    x_train = training[feat_cols]
+    y_train = training[target_col]
+    x_test = forecast_feat
+
+    best_model = opt_model(n_iter = n_iter, test_size = test_size)
+    best_model.fit(x_train, y_train)
+    model = best_model.best_estimator_
+    forecast = model.predict(x_test)
+    forecast = pd.DataFrame({"{}".format(y_train.name) : forecast}, index = x_test.index)
+
+    return x_test, model, forecast
+def important_feats(model, forecast_features, threshold):
+    
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(forecast_features)
+
+    importance = (pd.DataFrame({"Feature": forecast_features.columns, "Importance": np.abs(shap_values).mean(axis=0)}).sort_values("Importance", ascending=False))
+
+    feat_thresh = importance['Feature'][(importance['Importance'].cumsum()/importance['Importance'].sum()) < threshold].to_list()
+
+    return feat_thresh
+
+def nexog_recursive_forecast(data, target_col, months_ahead, n_sig_lags, n_iter, threshold, window_list = [3, 6, 9, 12]):
+
+    """
+    Takes preprocessed data and desired parameters \\
+    Returns n months ahead forecast
+    """
+    
     if isinstance(data, pd.Series):
-        data = data.to_frame(name=target_col)
+        data = data.to_frame()
+
+    if months_ahead < 1:
+        raise ValueError("You can't 'foresee' the present and the past, silly.")
+
+    lag_list = sig_lags(data[target_col], n_sig_lags = n_sig_lags)
+    full_data = make_lagroll_features(data = data, target_col = target_col, window_list = window_list, lag_list = lag_list)
+    forecast_feats, model, forecast = one_step_forecast(full_data, target_col, test_size = months_ahead, n_iter = n_iter)
+    imp_feats =  important_feats(model, forecast_feats, threshold = threshold)
+    imp_feats.insert(0, target_col)
+    forecast_feats, model, forecast = one_step_forecast(full_data[imp_feats], target_col, test_size = months_ahead, n_iter = n_iter)
+    new_data = pd.concat([data, forecast], axis = 0)
+
+
+    for i in range(months_ahead-1):
+        full_data = make_lagroll_features(data = new_data, target_col = target_col, window_list = window_list, lag_list = lag_list)
+        full_data = full_data[imp_feats]
+        _, forecast_feat = prep_training_data(data = full_data, target_col = target_col)
+        forecast = model.predict(forecast_feat)
+        forecast = pd.DataFrame({"{}".format(target_col) : forecast}, index = forecast_feat.index)
+        new_data = pd.concat([new_data, forecast], axis = 0)
+    
+    return model, new_data[-months_ahead:]
+
+def exog_forecast_feats(data, target_col, months_ahead, n_sig_lags, n_iter, threshold, window_list):
+    """
+    Inputs preprocessed data (w/ exogenous variables) \\
+    Returns dataframe of independent forecasts of exogenous variables 
+    """
 
     exog_cols = data.columns.drop(target_col).to_list()
-    exog_models = {}
-
-    final_data, _ = train_forecast_split(data, target_col)
-    full_feat, full_targ, forecast_feat = forecast_df(final_data, target_col)
-    _, model_test = model_pred(full_feat, full_targ, forecast_feat, n_iter=100)
-    model = model_test.best_estimator_
-    last_obs = forecast_feat.iloc[[0]]
+    exog_pred = pd.DataFrame()
 
     for col in exog_cols:
-        final_exog, _ = train_forecast_split(data, col)
-        full_feat_exog, full_targ_exog, forecast_feat_exog = forecast_df(final_exog, col)
-        _, model_test_exog = model_pred(full_feat_exog, full_targ_exog, forecast_feat_exog, n_iter=100)
-        exog_models[col] = model_test_exog.best_estimator_
+        exog_col = data[col].dropna()
+        _, forecast = nexog_recursive_forecast(data = exog_col, target_col = col, months_ahead = months_ahead,
+                                            n_sig_lags = n_sig_lags, n_iter = n_iter, threshold = threshold,
+                                            window_list = window_list)
+        exog_pred = pd.concat([exog_pred, forecast], axis = 1)
 
-    while iter <= months_ahead:
+    return exog_pred
 
-        for col in exog_cols:
-            final_exog, _ = train_forecast_split(data, col)
-            _, _, forecast_feat_exog = forecast_df(final_exog, col)
-            exog_forecast = exog_models[col].predict(forecast_feat_exog)[0]
-            data.loc[forecast_feat_exog.index[0], col] = exog_forecast
+def exog_lags(data, n_sig_lags):
 
-        final_data, _ = train_forecast_split(data, target_col)
-        _, _, forecast_feat = forecast_df(final_data, target_col)
-        model_forecast = model.predict(forecast_feat)
-        data.loc[forecast_feat.index[0], target_col] = model_forecast[0]
+    """
+    Input dataframe to find appropriate lags for each column \\
+    Returns dictionary of lag arrays for each column
+    """
 
-        iter += 1
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
 
-    explainer = shap.TreeExplainer(model)
+    lag_dict = {}
 
-    shap.waterfall_plot(shap.Explanation(values=explainer.shap_values(last_obs)[0], base_values=explainer.expected_value, data=last_obs.iloc[0], feature_names=last_obs.columns))
-    plt.show()
+    for col in data.columns.to_list():
+        lag_list = sig_lags(data = data[col], n_sig_lags = n_sig_lags)
+        lag_dict[col] = lag_list
 
-    return data[-months_ahead:]
+    return lag_dict
+
+def lag_roll_exog(data, window_list, lag_dict):
+
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+
+    full_data = pd.DataFrame()
+
+    for col in data.columns.to_list():
+        lag_roll = make_lagroll_features(data = data[col], target_col=col, window_list = window_list, lag_list = lag_dict[col])
+        full_data = pd.concat([full_data, lag_roll], axis = 1)
+
+    full_data = full_data.loc[: , ~full_data.columns.duplicated()]
+
+    return full_data
+
+def exog_recursive_forecast(data, target_col, months_ahead, n_sig_lags, n_iter, threshold, window_list = [3, 6, 9, 12]):
+    
+    exog_feats = exog_forecast_feats(data = data, target_col = target_col, months_ahead = months_ahead, 
+                                 n_sig_lags = n_sig_lags, n_iter = n_iter, threshold = threshold,
+                                 window_list = window_list)
+    ex_lags = exog_lags(data = data, n_sig_lags=n_sig_lags)
+    
+    full_data = lag_roll_exog(data = data, window_list = window_list, lag_dict = ex_lags)
+
+    exog_ffeat, exog_model, exog_forecast = one_step_forecast(data = full_data, target_col = target_col, test_size = months_ahead, n_iter = n_iter)
+
+    imp_feats = important_feats(exog_model, exog_ffeat, threshold)
+    imp_feats.insert(0, target_col)
+    
+    exog_ffeat, exog_model, exog_forecast = one_step_forecast(data = full_data[imp_feats], target_col = target_col, test_size = months_ahead, n_iter = n_iter)
+
+    targ_exog_forecast = pd.concat([exog_forecast, exog_feats.loc[exog_forecast.index]], axis = 1)
+    up_data = pd.concat([data, targ_exog_forecast], axis = 0)
+
+    for i in range(months_ahead-1):
+        full_data = lag_roll_exog(data = up_data, window_list = window_list, lag_dict = ex_lags)
+        full_data = full_data[imp_feats].dropna()
+
+        _, forecast_feat = prep_training_data(data = full_data, target_col = target_col)
+        exog_forecast = pd.Series(exog_model.predict(forecast_feat), index = forecast_feat.index, name = target_col)
+        targ_exog_forecast = pd.concat([exog_forecast, exog_feats.loc[exog_forecast.index]], axis = 1)
+        up_data = pd.concat([up_data, targ_exog_forecast], axis = 0)
+
+    return exog_model, up_data[-months_ahead:]
