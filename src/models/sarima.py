@@ -11,9 +11,8 @@ def eval_metrics(actual, forecast):
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(actual, forecast)
         r2 = r2_score(actual, forecast)
-        std = np.std(actual)
 
-        results = {"RMSE": rmse, "MAE": mae, "R2": r2, "STD": std, "RMSE/STD": rmse / std}
+        results = {"RMSE": rmse, "MAE": mae, "R2": r2}
 
         return results
 
