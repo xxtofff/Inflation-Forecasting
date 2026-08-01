@@ -106,7 +106,8 @@ Forecast outputs are saved to `outputs/forecasts/`, while generated figures are 
 │       ├── naive.py
 │       ├── sarima.py
 │       └── xgboost.py
-└── README.md
+├── README.md
+└── requirements.txt
 ```
 
 ## Workflow
